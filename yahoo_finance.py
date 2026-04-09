@@ -1,319 +1,206 @@
 # ========================================
-# ULTIMATE AI STOCK + CRYPTO DASHBOARD
+# Yahoo Finance Real-Time Stock Dashboard
 # ========================================
 
 import streamlit as st
 import pandas as pd
-import numpy as np
-import yfinance as yf
 import plotly.graph_objects as go
-import plotly.express as px
 from plotly.subplots import make_subplots
-from streamlit_autorefresh import st_autorefresh
+import yfinance as yf
+from datetime import datetime
+import numpy as np
+# from streamlit_autorefresh import st_autorefresh
 
 # ─────────────────────────────────────────────
 # PAGE CONFIG
 # ─────────────────────────────────────────────
 st.set_page_config(
-    page_title="Ultimate AI Trading Dashboard",
+    page_title="Yahoo Finance Dashboard",
     page_icon="📈",
-    layout="wide"
+    layout="wide",
 )
 
 # ─────────────────────────────────────────────
-# DEFAULTS
+# CONSTANTS
 # ─────────────────────────────────────────────
-US_STOCKS = ["AAPL","MSFT","TSLA","NVDA"]
-INDIAN_STOCKS = ["RELIANCE.NS","TCS.NS","INFY.NS","HDFCBANK.NS"]
-CRYPTO = ["BTC-USD","ETH-USD","SOL-USD","DOGE-USD"]
+REFRESH_TTL = 1800
+DEFAULT_TICKERS = ["AAPL", "MSFT", "TSLA", "NVDA"]
 
-REFRESH_TTL = 600
+# ─────────────────────────────────────────────
+# AUTO REFRESH
+# ─────────────────────────────────────────────
+# refresh_min = st.sidebar.slider("Auto-refresh (min)", 5, 60, 30)
+# st_autorefresh(interval=refresh_min * 60000, key="refresh")
+
+# ─────────────────────────────────────────────
+# DATA FUNCTIONS
+# ─────────────────────────────────────────────
+@st.cache_data(ttl=REFRESH_TTL)
+def get_hist(ticker, period):
+    df = yf.download(ticker, period=period, interval="1d", progress=False, auto_adjust=True)
+    if df.empty:
+        return df
+
+    # FIX 1: yfinance may return MultiIndex columns — flatten them
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+
+    # FIX 2: Ensure Close is a plain Series
+    df["Close"] = df["Close"].squeeze()
+
+    df["Returns"] = df["Close"].pct_change()
+    df["Volatility"] = df["Returns"].rolling(7).std() * 100
+    df["MA7"] = df["Close"].rolling(7).mean()
+    df["MA20"] = df["Close"].rolling(20).mean()
+    df["MA50"] = df["Close"].rolling(50).mean()
+    return df
+
+
+@st.cache_data(ttl=REFRESH_TTL)
+def get_multi(tickers, period):
+    data = {}
+    for t in tickers:
+        df = get_hist(t, period)
+        if not df.empty:
+            data[t] = df
+    return data
+
+
+def detect_anomalies(df):
+    df = df.copy()
+    # FIX 3: Drop NaN before computing stats (pct_change gives NaN at row 0)
+    returns = df["Returns"].dropna()
+
+    if len(returns) < 2:
+        df["z"] = 0.0
+        df["anom"] = False
+        return df
+
+    mu = returns.mean()
+    sigma = returns.std()
+
+    if sigma == 0 or pd.isna(sigma):
+        df["z"] = 0.0
+        df["anom"] = False
+        return df
+
+    df["z"] = (df["Returns"] - mu) / sigma
+    df["anom"] = df["z"].abs() > 2.5
+    return df
+
 
 # ─────────────────────────────────────────────
 # SIDEBAR
 # ─────────────────────────────────────────────
-st.sidebar.title("⚙️ Dashboard Settings")
+st.sidebar.title("📈 Settings")
 
-refresh = st.sidebar.slider("Auto Refresh",30,600,120)
-st_autorefresh(interval=refresh*1000)
-
-market = st.sidebar.selectbox(
-    "Select Market",
-    ["US Stocks","Indian Stocks","Crypto","Mixed"]
+chosen = st.sidebar.multiselect(
+    "Select Tickers", DEFAULT_TICKERS, default=["AAPL", "MSFT"]
 )
 
-if market == "US Stocks":
-    tickers = st.sidebar.multiselect("Stocks",US_STOCKS,default=US_STOCKS[:2])
+custom = st.sidebar.text_input("Add ticker")
 
-elif market == "Indian Stocks":
-    tickers = st.sidebar.multiselect("Stocks",INDIAN_STOCKS,default=INDIAN_STOCKS[:2])
+if custom.strip():
+    t = custom.strip().upper()
+    if t not in chosen:
+        chosen.append(t)
 
-elif market == "Crypto":
-    tickers = st.sidebar.multiselect("Crypto",CRYPTO,default=CRYPTO[:2])
-
-else:
-    tickers = st.sidebar.multiselect(
-        "Mixed",
-        US_STOCKS+INDIAN_STOCKS+CRYPTO,
-        default=["AAPL","RELIANCE.NS","BTC-USD"]
-    )
-
-custom = st.sidebar.text_input("Add Custom Symbol")
-
-if custom:
-    tickers.append(custom.upper())
-
-period = st.sidebar.selectbox(
-    "Period",
-    ["1mo","3mo","6mo","1y","2y","5y"]
-)
-
-# ─────────────────────────────────────────────
-# INDICATORS
-# ─────────────────────────────────────────────
-def RSI(data,window=14):
-    delta=data.diff()
-    gain=(delta.where(delta>0,0)).rolling(window).mean()
-    loss=(-delta.where(delta<0,0)).rolling(window).mean()
-    rs=gain/loss
-    return 100-(100/(1+rs))
-
-def MACD(data):
-    exp1=data.ewm(span=12).mean()
-    exp2=data.ewm(span=26).mean()
-    macd=exp1-exp2
-    signal=macd.ewm(span=9).mean()
-    return macd,signal
+period = st.sidebar.selectbox("Period", ["1mo", "3mo", "6mo", "1y"])
 
 # ─────────────────────────────────────────────
 # LOAD DATA
 # ─────────────────────────────────────────────
-@st.cache_data(ttl=REFRESH_TTL)
-def load_data(ticker):
-
-    df=yf.download(
-        ticker,
-        period=period,
-        interval="1d",
-        auto_adjust=True,
-        progress=False
-    )
-
-    if isinstance(df.columns,pd.MultiIndex):
-        df.columns=df.columns.get_level_values(0)
-
-    df["MA20"]=df["Close"].rolling(20).mean()
-    df["MA50"]=df["Close"].rolling(50).mean()
-
-    df["Returns"]=df["Close"].pct_change()
-    df["Volatility"]=df["Returns"].rolling(7).std()
-
-    df["RSI"]=RSI(df["Close"])
-
-    macd,signal=MACD(df["Close"])
-    df["MACD"]=macd
-    df["Signal"]=signal
-
-    df["Upper"]=df["MA20"]+2*df["Close"].rolling(20).std()
-    df["Lower"]=df["MA20"]-2*df["Close"].rolling(20).std()
-
-    return df
-
-
-data={}
-
-for t in tickers:
-    df=load_data(t)
-    if not df.empty:
-        data[t]=df
-
-if not data:
-    st.error("No Data Found")
+if not chosen:
+    st.warning("Select at least one ticker")
     st.stop()
 
-# ─────────────────────────────────────────────
-# TITLE
-# ─────────────────────────────────────────────
-st.title("🚀 Ultimate AI Trading Dashboard")
+data = get_multi(chosen, period)
+
+if not data:
+    st.error("No data found")
+    st.stop()
 
 # ─────────────────────────────────────────────
 # KPI
 # ─────────────────────────────────────────────
-cols=st.columns(len(data))
+st.title("📊 Stock Dashboard")
 
-for col,(ticker,df) in zip(cols,data.items()):
+cols = st.columns(len(data))
 
-    price=df["Close"].iloc[-1]
-    prev=df["Close"].iloc[-2]
+for col, (ticker, df) in zip(cols, data.items()):
+    # FIX 4: Extract scalar values explicitly to avoid Series-in-metric errors
+    price = float(df["Close"].iloc[-1])
+    prev  = float(df["Close"].iloc[-2]) if len(df) > 1 else price
+    change = price - prev
+    pct = (change / prev) * 100 if prev else 0.0
 
-    pct=(price-prev)/prev*100
-
-    col.metric(
-        ticker,
-        f"{price:.2f}",
-        f"{pct:.2f}%"
-    )
-
-# ─────────────────────────────────────────────
-# AI SIGNAL
-# ─────────────────────────────────────────────
-st.subheader("🤖 AI Buy / Sell Signals")
-
-signals=[]
-
-for ticker,df in data.items():
-
-    rsi=df["RSI"].iloc[-1]
-    macd=df["MACD"].iloc[-1]
-    signal=df["Signal"].iloc[-1]
-
-    if rsi<30 and macd>signal:
-        rec="BUY"
-    elif rsi>70 and macd<signal:
-        rec="SELL"
-    else:
-        rec="HOLD"
-
-    signals.append({
-        "Ticker":ticker,
-        "RSI":round(rsi,2),
-        "Recommendation":rec
-    })
-
-signal_df=pd.DataFrame(signals)
-
-st.dataframe(signal_df,use_container_width=True)
+    col.metric(ticker, f"${price:.2f}", f"{pct:.2f}%")
 
 # ─────────────────────────────────────────────
 # CHART
 # ─────────────────────────────────────────────
-focus=st.selectbox("Select Chart",list(data.keys()))
-df=data[focus]
+focus = list(data.keys())[0]
+df = data[focus]
 
-fig=make_subplots(
-    rows=4,
-    cols=1,
+fig = make_subplots(
+    rows=2, cols=1,
     shared_xaxes=True,
-    row_heights=[0.5,0.2,0.15,0.15]
+    row_heights=[0.7, 0.3],
+    vertical_spacing=0.05,
 )
 
-fig.add_trace(
-    go.Candlestick(
-        x=df.index,
-        open=df["Open"],
-        high=df["High"],
-        low=df["Low"],
-        close=df["Close"]
-    ),
-    row=1,col=1
-)
+fig.add_trace(go.Candlestick(
+    x=df.index,
+    open=df["Open"],
+    high=df["High"],
+    low=df["Low"],
+    close=df["Close"],
+    name="Price"
+), row=1, col=1)
 
-fig.add_trace(go.Scatter(x=df.index,y=df["MA20"],name="MA20"),row=1,col=1)
-fig.add_trace(go.Scatter(x=df.index,y=df["MA50"],name="MA50"),row=1,col=1)
+fig.add_trace(go.Scatter(x=df.index, y=df["MA7"],  name="MA7",  line=dict(width=1)), row=1, col=1)
+fig.add_trace(go.Scatter(x=df.index, y=df["MA20"], name="MA20", line=dict(width=1)), row=1, col=1)
 
-fig.add_trace(go.Bar(x=df.index,y=df["Volume"]),row=2,col=1)
+fig.add_trace(go.Bar(x=df.index, y=df["Volume"], name="Volume"), row=2, col=1)
 
-fig.add_trace(go.Scatter(x=df.index,y=df["RSI"]),row=3,col=1)
+fig.update_layout(xaxis_rangeslider_visible=False)
 
-fig.add_trace(go.Scatter(x=df.index,y=df["MACD"]),row=4,col=1)
-fig.add_trace(go.Scatter(x=df.index,y=df["Signal"]),row=4,col=1)
-
-fig.update_layout(height=900,xaxis_rangeslider_visible=False)
-
-st.plotly_chart(fig,use_container_width=True)
+st.plotly_chart(fig, use_container_width=True)
 
 # ─────────────────────────────────────────────
-# PORTFOLIO TRACKER
+# ANOMALIES
 # ─────────────────────────────────────────────
-st.subheader("💼 Portfolio Tracker")
+st.subheader("⚠️ Anomalies")
 
-portfolio=[]
+df_a = detect_anomalies(df)
+anom = df_a[df_a["anom"]]
 
-for ticker,df in data.items():
-
-    qty=st.number_input(
-        f"{ticker} Quantity",
-        value=0,
-        key=ticker
-    )
-
-    price=df["Close"].iloc[-1]
-
-    value=qty*price
-
-    portfolio.append({
-        "Ticker":ticker,
-        "Qty":qty,
-        "Price":round(price,2),
-        "Value":round(value,2)
-    })
-
-port_df=pd.DataFrame(portfolio)
-
-st.dataframe(port_df)
-
-st.metric(
-    "Total Portfolio Value",
-    round(port_df["Value"].sum(),2)
-)
+if anom.empty:
+    st.success("No anomalies found")
+else:
+    for idx, row in anom.tail(5).iterrows():
+        # FIX 5: Safely convert index to date regardless of index type
+        date_str = pd.Timestamp(idx).date() if not isinstance(idx, datetime) else idx.date()
+        st.write(f"{date_str} → {float(row['Returns']) * 100:.2f}%")
 
 # ─────────────────────────────────────────────
-# RETURNS
+# SUMMARY TABLE
 # ─────────────────────────────────────────────
-st.subheader("📈 Returns")
+rows = []
 
-ret=pd.DataFrame()
-
-for t,df in data.items():
-    ret[t]=df["Close"]/df["Close"].iloc[0]
-
-st.line_chart(ret)
-
-# ─────────────────────────────────────────────
-# CORRELATION
-# ─────────────────────────────────────────────
-st.subheader("🔥 Correlation")
-
-corr=ret.corr()
-
-fig_corr=px.imshow(
-    corr,
-    text_auto=True,
-    color_continuous_scale="RdBu"
-)
-
-st.plotly_chart(fig_corr)
-
-# ─────────────────────────────────────────────
-# SUMMARY
-# ─────────────────────────────────────────────
-rows=[]
-
-for t,df in data.items():
-
-    price=df["Close"].iloc[-1]
-    first=df["Close"].iloc[0]
-
-    ret=(price/first-1)*100
-    vol=df["Returns"].std()*np.sqrt(252)*100
+for ticker, df in data.items():
+    # FIX 6: Use float() to guarantee scalar arithmetic
+    price = float(df["Close"].iloc[-1])
+    first = float(df["Close"].iloc[0])
+    ret   = (price / first - 1) * 100 if first else 0.0
+    vol   = float(df["Returns"].std()) * np.sqrt(252) * 100
 
     rows.append({
-        "Ticker":t,
-        "Price":round(price,2),
-        "Return %":round(ret,2),
-        "Volatility":round(vol,2)
+        "Ticker":       ticker,
+        "Price":        round(price, 2),
+        "Return %":     round(ret,   2),
+        "Volatility %": round(vol,   2),
     })
 
-summary=pd.DataFrame(rows)
-
-st.subheader("📊 Summary")
-
-st.dataframe(summary)
-
-st.download_button(
-    "Download CSV",
-    summary.to_csv().encode(),
-    "stocks.csv"
-)
-
-st.success("Ultimate Dashboard Ready 🚀")
+summary = pd.DataFrame(rows)
+st.dataframe(summary, use_container_width=True)
